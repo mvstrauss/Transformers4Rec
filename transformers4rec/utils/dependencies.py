@@ -37,3 +37,13 @@ def is_merlin_dataloader_available() -> bool:
     except ImportError:
         merlin.dataloader = None
     return merlin.dataloader is not None
+
+
+def is_rocm_available() -> bool:
+    """Check if ROCm is available via PyTorch's HIP backend."""
+    try:
+        import torch
+
+        return torch.cuda.is_available() and torch.version.hip is not None
+    except (ImportError, AttributeError):
+        return False

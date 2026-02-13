@@ -429,7 +429,11 @@ def right_shift_block(self, other):
         out.input_size = left_side[-1].input_size
 
     if need_moving_to_gpu:
-        out.to("cuda")
+        # Infer target device from existing module parameters instead of
+        # hard-coding "cuda" -- works on both CUDA and ROCm.
+        source = self if isinstance(self, torch.nn.Module) else other
+        target_device = next(source.parameters()).device
+        out.to(target_device)
 
     return out
 

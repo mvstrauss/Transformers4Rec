@@ -73,12 +73,26 @@ class T4RecTrainingArguments(TrainingArguments):
     )
 
     data_loader_engine: str = field(
-        default="merlin",
+        default=None,
         metadata={
             "help": "Parquet data loader engine. "
-            "'merlin': GPU-accelerated parquet data loader from Merlin, 'pyarrow': read whole parquet into memory."
+            "'merlin': GPU-accelerated parquet data loader from Merlin, "
+            "'rocm': PyArrow-based loader for AMD ROCm GPUs, "
+            "'pyarrow': read whole parquet into memory. "
+            "Auto-detected if not set (rocm on AMD, merlin on NVIDIA)."
         },
     )
+
+    def __post_init__(self):
+        # Auto-detect data_loader_engine before the parent validates arguments
+        if self.data_loader_engine is None:
+            from transformers4rec.utils.dependencies import is_rocm_available
+
+            if is_rocm_available():
+                self.data_loader_engine = "rocm"
+            else:
+                self.data_loader_engine = "merlin"
+        super().__post_init__()
 
     eval_on_test_set: bool = field(
         default=False,

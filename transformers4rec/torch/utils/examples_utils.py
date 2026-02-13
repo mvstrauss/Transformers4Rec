@@ -100,4 +100,5 @@ def fit_and_evaluate(trainer, start_time_index, end_time_index, input_dir):
 
 def wipe_memory():
     gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()

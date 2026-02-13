@@ -166,6 +166,62 @@ def session_aggregator(
     return session_data
 
 
+def session_aggregator_pandas(
+    df,
+    session_col: str = "session_id",
+    item_feature_cols: list = None,
+    session_feature_cols: list = None,
+    maximum_length: int = 20,
+    minimum_length: int = 2,
+):
+    """
+    Pure-pandas replacement for ``session_aggregator`` that does **not** need
+    NVTabular or any NVIDIA RAPIDS dependency.  Groups item interactions by
+    session and aggregates item features into lists.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Item-level interaction DataFrame.
+    session_col : str
+        Name of the session ID column.
+    item_feature_cols : list of str
+        Columns to aggregate as lists (e.g. ``["item_id", "category"]``).
+    session_feature_cols : list of str, optional
+        Columns where the first value per session is kept.
+    maximum_length : int
+        Trim session lists to this length.
+    minimum_length : int
+        Drop sessions shorter than this.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Session-level DataFrame with list columns.
+    """
+    import pandas as pd  # noqa: F811
+
+    if item_feature_cols is None:
+        raise ValueError("item_feature_cols must be provided")
+    session_feature_cols = session_feature_cols or []
+
+    agg_dict = {col: list for col in item_feature_cols}
+    for col in session_feature_cols:
+        agg_dict[col] = "first"
+
+    grouped = df.groupby(session_col).agg(agg_dict).reset_index()
+
+    # Trim lists to maximum_length
+    for col in item_feature_cols:
+        grouped[col] = grouped[col].apply(lambda x: x[:maximum_length])
+
+    # Filter out short sessions
+    ref_col = item_feature_cols[0]
+    grouped = grouped[grouped[ref_col].apply(len) >= minimum_length]
+
+    return grouped
+
+
 def save_time_based_splits(
     data,
     output_dir: str,

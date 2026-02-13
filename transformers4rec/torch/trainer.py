@@ -758,7 +758,8 @@ class Trainer(BaseTrainer):
         random.setstate(checkpoint_rng_state["python"])
         np.random.set_state(checkpoint_rng_state["numpy"])
         torch.random.set_rng_state(checkpoint_rng_state["cpu"])
-        torch.cuda.random.set_rng_state_all(checkpoint_rng_state["cuda"])
+        if "cuda" in checkpoint_rng_state and torch.cuda.is_available():
+            torch.cuda.random.set_rng_state_all(checkpoint_rng_state["cuda"])
         # Restoring AMP scaler
         if self._use_cuda_amp:
             self.scaler.load_state_dict(

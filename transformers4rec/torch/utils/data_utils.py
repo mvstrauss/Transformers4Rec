@@ -14,28 +14,70 @@
 # limitations under the License.
 #
 
+import glob as glob_module
 import logging
 import warnings
 from abc import ABC
 
 import numpy as np
 import torch
-from merlin.dataloader.torch import Loader
-from merlin.models.utils.misc_utils import validate_dataset
-from merlin.models.utils.registry import Registry
-from merlin.schema import Tags
-from merlin.schema.io.tensorflow_metadata import TensorflowMetadata
 from torch.utils.data import DataLoader as PyTorchDataLoader
 from torch.utils.data import Dataset, IterableDataset
-
-from merlin_standard_lib import Schema
-from transformers4rec.torch.utils.padding import pad_batch
 
 from ...utils import dependencies
 
 logger = logging.getLogger(__name__)
 
-dataloader_registry: Registry = Registry("torch.dataloader_loader")
+# ---------------------------------------------------------------------------
+# Merlin schema & registry -- pure-Python packages that should install
+# without CUDA.  Guarded so the module can still load if merlin is absent.
+# ---------------------------------------------------------------------------
+try:
+    from merlin.models.utils.registry import Registry
+    from merlin.schema import Tags
+    from merlin.schema.io.tensorflow_metadata import TensorflowMetadata
+    from merlin_standard_lib import Schema
+
+    dataloader_registry: Registry = Registry("torch.dataloader_loader")
+except ImportError:
+    Registry = None  # type: ignore[assignment,misc]
+    Tags = None  # type: ignore[assignment,misc]
+    TensorflowMetadata = None  # type: ignore[assignment,misc]
+    Schema = None  # type: ignore[assignment,misc]
+
+    class _FallbackRegistry:
+        """Minimal registry so ROCmDataLoader can register without merlin."""
+
+        def __init__(self):
+            self._registry = {}
+
+        def register_with_multiple_names(self, *names):
+            def decorator(cls):
+                for name in names:
+                    self._registry[name] = cls
+                return cls
+            return decorator
+
+        def parse(self, name):
+            return self._registry[name]
+
+    dataloader_registry = _FallbackRegistry()  # type: ignore[assignment]
+
+# ---------------------------------------------------------------------------
+# NVIDIA Merlin dataloader -- only available on CUDA systems with the
+# merlin-dataloader package installed.  Guarded so ROCm systems can skip it.
+# ---------------------------------------------------------------------------
+_merlin_loader_available = False
+try:
+    from merlin.dataloader.torch import Loader
+    from merlin.models.utils.misc_utils import validate_dataset
+
+    _merlin_loader_available = True
+except ImportError:
+    Loader = None  # type: ignore[assignment,misc]
+    validate_dataset = None  # type: ignore[assignment,misc]
+
+from transformers4rec.torch.utils.padding import pad_batch
 
 
 class T4RecDataLoader(ABC):
@@ -210,76 +252,161 @@ class DLDataLoader(PyTorchDataLoader):
         return len(self.dataset)
 
 
-@dataloader_registry.register_with_multiple_names(
-    "merlin_dataloader", "merlin", "nvtabular_dataloader", "nvtabular"
-)
-class MerlinDataLoader(T4RecDataLoader, DLDataLoader):
+# ---------------------------------------------------------------------------
+# ROCm-compatible DataLoader  (no NVIDIA Merlin dependency)
+# Uses PyArrow (already a base dependency) for Parquet reading and standard
+# PyTorch DataLoader for batching / shuffling / DDP distribution.
+# ---------------------------------------------------------------------------
+import pyarrow.parquet as pq
+from torch.utils.data.distributed import DistributedSampler
+
+
+class _ROCmParquetDataset(Dataset):
+    """Torch map-style Dataset backed by Parquet files, read via PyArrow."""
+
+    def __init__(self, paths, cols_to_read, target_names, list_cols, max_seq_len):
+        import pandas as pd
+
+        self.target_names = set(target_names)
+        self.list_cols = set(list_cols)
+        self.max_seq_len = max_seq_len
+        self.cols_to_read = cols_to_read
+
+        # Read all parquet files into a single pandas DataFrame
+        frames = []
+        for p in paths:
+            table = pq.read_table(p, columns=cols_to_read if cols_to_read else None)
+            frames.append(table.to_pandas())
+        self.data = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        row = self.data.iloc[index]
+        input_cols = [c for c in self.cols_to_read if c not in self.target_names]
+        inputs = {col: self._to_tensor(row[col], col) for col in input_cols}
+        targets = {col: self._to_tensor(row[col], col) for col in self.target_names}
+        return inputs, targets
+
+    def _to_tensor(self, value, col_name):
+        """Convert a single cell value to a torch Tensor, padding sequences."""
+        if isinstance(value, (list, np.ndarray)):
+            arr = np.asarray(value)
+            # Trim to max_seq_len
+            arr = arr[: self.max_seq_len]
+            # Pad if shorter
+            if len(arr) < self.max_seq_len:
+                pad = np.zeros(self.max_seq_len, dtype=arr.dtype)
+                pad[: len(arr)] = arr
+                arr = pad
+            if np.issubdtype(arr.dtype, np.floating):
+                return torch.tensor(arr, dtype=torch.float32)
+            return torch.tensor(arr, dtype=torch.long)
+        elif isinstance(value, (int, np.integer)):
+            return torch.tensor(value, dtype=torch.long)
+        elif isinstance(value, (float, np.floating)):
+            return torch.tensor(value, dtype=torch.float32)
+        else:
+            return torch.tensor(value)
+
+
+class _HipDFParquetDataset(Dataset):
     """
-    This class extends the [Merlin data loader]
-    (https://github.com/NVIDIA-Merlin/dataloader/blob/stable/merlin/dataloader/torch.py).
-    The data input requires a merlin.io.Dataset or a path to the data files.
-    It also sets the dataset's schema with the necessary properties to prepare the input
-    list features as dense tensors (i.e. padded to the specified `max_sequence_length`).
-    The dense representation is required by the Transformers4Rec input modules.
+    GPU-accelerated Dataset using hipDF (cuDF on ROCm) for Parquet reading.
+
+    When hipDF and CuPy-ROCm are installed, this reads data directly into
+    GPU memory and converts to PyTorch tensors via DLPack (zero-copy when
+    possible).  Falls back gracefully if hipDF is not available -- callers
+    should check ``dependencies.is_gpu_dataloader_available()`` first.
+    """
+
+    def __init__(self, paths, cols_to_read, target_names, list_cols, max_seq_len, device=0):
+        import cudf  # hipDF provides this on ROCm
+
+        self.target_names = set(target_names)
+        self.list_cols = set(list_cols)
+        self.max_seq_len = max_seq_len
+        self.cols_to_read = cols_to_read
+        self.device = device
+
+        frames = [cudf.read_parquet(p, columns=cols_to_read if cols_to_read else None)
+                  for p in paths]
+        self.data = cudf.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        row = self.data.iloc[index]
+        input_cols = [c for c in self.cols_to_read if c not in self.target_names]
+        inputs = {col: self._to_tensor(row[col], col) for col in input_cols}
+        targets = {col: self._to_tensor(row[col], col) for col in self.target_names}
+        return inputs, targets
+
+    def _to_tensor(self, value, col_name):
+        """Convert a cuDF cell to a torch Tensor, with optional zero-copy via DLPack."""
+        import cupy as cp
+
+        if col_name in self.list_cols:
+            # List / sequence column -- convert through cupy for GPU-resident data
+            if hasattr(value, "to_arrow"):
+                arr = cp.array(value.to_arrow().as_py())
+            elif hasattr(value, "values_host"):
+                arr = cp.array(value.values_host)
+            else:
+                arr = cp.array(value if isinstance(value, (list, np.ndarray)) else [value])
+
+            arr = arr[: self.max_seq_len]
+            if len(arr) < self.max_seq_len:
+                padded = cp.zeros(self.max_seq_len, dtype=arr.dtype)
+                padded[: len(arr)] = arr
+                arr = padded
+
+            # DLPack zero-copy: cupy -> torch
+            return torch.from_dlpack(arr)
+        else:
+            # Scalar value -- small, just create tensor directly
+            if hasattr(value, "item"):
+                value = value.item()
+            if isinstance(value, (int, np.integer)):
+                return torch.tensor(value, dtype=torch.long)
+            elif isinstance(value, (float, np.floating)):
+                return torch.tensor(value, dtype=torch.float32)
+            return torch.tensor(value)
+
+
+@dataloader_registry.register_with_multiple_names("rocm_dataloader", "rocm")
+class ROCmDataLoader(T4RecDataLoader):
+    """
+    ROCm-compatible data loader using PyArrow for Parquet reading and
+    standard PyTorch DataLoader for batching.  Drop-in replacement for
+    MerlinDataLoader that does **not** depend on NVIDIA Merlin dataloader.
+
+    It produces ``(inputs_dict, targets_dict)`` batches identical in format
+    to MerlinDataLoader, so the T4Rec Trainer works without modification.
 
     Parameters
     ----------
-    paths_or_dataset: Union[str, merlin.io.Dataset]
-        The dataset to load.
-    batch_size: int
-        The size of each batch to supply to the model.
-    max_sequence_length: int
-        The maximum sequence length to use for padding list columns.
-        By default, `0` is used as the padding index.
-    cats : List[str], optional
-        The list of categorical columns in the dataset.
-        By default None.
-    conts: List[str], optional
-        The list of continuous columns in the dataset.
-        By default None.
-    labels : List[str], optional
-        The list of label columns in the dataset.
-        By default None.
-    lists : List[str], optional
-        The list of sequential columns in the dataset.
-        By default None.
-    shuffle : bool, optional
-        Enable/disable shuffling of dataset.
-        By default False.
-    parts_per_chunk : int, optional
-        The number of partitions from the iterator, an Merlin Dataset,
-        to concatenate into a "chunk". By default 1.
+    paths_or_dataset : Union[str, list]
+        Path(s) to Parquet data files or glob patterns.
+    batch_size : int
+        Batch size.
+    max_sequence_length : int, optional
+        Maximum length for padding / trimming list (sequence) features.
+    cats, conts, labels, lists : list of str, optional
+        Column names by type (categorical, continuous, target, list/sequence).
+    shuffle : bool
+        Whether to shuffle data each epoch.
     device : int, optional
-        The device id of the selected GPU
-        By default None.
-    drop_last: bool, optional
-        Whether or not to drop the last batch in an epoch. This is useful when you need to
-        guarantee that each batch contains exactly `batch_size` rows - since the last batch
-        will usually contain fewer rows.
-    seed_fn: callable
-        Function used to initialize random state
-    parts_per_chunk: int
-        Number of dataset partitions with size dictated by `buffer_size`
-        to load and concatenate asynchronously. More partitions leads to
-        better epoch-level randomness but can negatively impact throughput
-    global_size: int, optional
-        When doing distributed training, this indicates the number of total processes that are
-        training the model.
-    global_rank: int, optional
-        When doing distributed training, this indicates the local rank for the current process.
-    schema: Schema, optional
-         The `Schema` with the input features.
-    reader_kwargs:
-        Extra arguments to pass to the merlin.io.Dataset object, when the path to data files
-        is provided in `paths_or_dataset` argument.
-    row_groups_per_part: bool, optional
-        If true, preserve the group partitions when loading the dataset from parquet files.
-    collate_fn: Callable, optional
-        A processing function to collect and prepare the list samples
-        (tuple of (input, target) Tensor(s)) returned by the Merlin DataLoader.
-    transforms: List[merlin.dag.BaseOperator]
-        A list of operators that the Merlin dataloader applies on top of the loaded
-        batch, which is a tuple of input and target tensors.
+        GPU device id (unused for data placement; tensors are moved by the
+        HF Trainer's ``_prepare_inputs``).
+    global_size, global_rank : int, optional
+        DDP world size and rank -- a ``DistributedSampler`` is used when set.
+    num_workers : int
+        Number of PyTorch DataLoader workers.  Default 2.
+    pin_memory : bool
+        Pin CPU memory for faster GPU transfer.  Default True.
     """
 
     def __init__(
@@ -291,148 +418,126 @@ class MerlinDataLoader(T4RecDataLoader, DLDataLoader):
         cats=None,
         labels=None,
         lists=None,
-        collate_fn=lambda x: x[0],
-        engine=None,
-        buffer_size=0.1,
-        reader_kwargs=None,
+        collate_fn=None,
         shuffle=False,
-        seed_fn=None,
-        parts_per_chunk=1,
         device=None,
         global_size=None,
         global_rank=None,
         drop_last=False,
         schema=None,
-        row_groups_per_part=True,
-        transforms=None,
+        num_workers=2,
+        pin_memory=True,
         **kwargs,
     ):
         T4RecDataLoader.__init__(self)
-
-        self.paths_or_dataset = paths_or_dataset
         self.batch_size = batch_size
-        self.shuffle = shuffle
         self.max_sequence_length = max_sequence_length
         self.drop_last = drop_last
-
-        reader_kwargs = reader_kwargs or {}
-        reader_kwargs["row_groups_per_part"] = row_groups_per_part
-        self.set_dataset(buffer_size, engine, reader_kwargs, schema=schema)
-
-        if (global_rank is not None) and (self.dataset.npartitions < global_size):
-            logger.warning(
-                "UserWarning: User is advised to repartition the parquet file before training "
-                "so npartitions>=global_size. Cudf or pandas can be used for repartitioning "
-                "eg. pdf.to_parquet('file.parquet',row_group_size=N_ROWS/NPARTITIONS) for pandas "
-                "or gdf.to_parquet('file.parquet',row_group_size_rows=N_ROWS/NPARTITIONS) for cudf "
-                "so that npartitions=nr_rows/row_group_size. Also ensure npartitions is divisible "
-                "by number of GPUs to be used (eg. 2 or 4 partitions, if 2 GPUs will be used)."
-            )
-            self.dataset = self.dataset.repartition(npartitions=global_size)
-
-        if (global_rank is not None) and (self.dataset.npartitions % global_size != 0):
-            logger.warning(
-                f"UserWarning: User is advised to set the number of partitions"
-                f" ({self.dataset.npartitions}) divisible by the number of available"
-                f" GPUs ({global_size}). This will divide the work equally among GPUs"
-                " for DDP training and ensure optimal performance."
-            )
-
-        self.dataset.schema = self._augment_schema(
-            self.dataset.schema,
-            cats=cats,
-            conts=conts,
-            labels=labels,
-            lists=lists,
-        )
-
-        loader = Loader(
-            self.dataset,
-            self.batch_size,
-            shuffle,
-            seed_fn=seed_fn,
-            parts_per_chunk=parts_per_chunk,
-            device=device,
-            global_size=global_size,
-            global_rank=global_rank,
-            drop_last=drop_last,
-            transforms=transforms,
-        )
-        if max_sequence_length:
-            # Apply padding
-            output_schema = loader.output_schema
-            sparse_feats = [col.name for col in output_schema if Tags.LIST in col.tags]
-            sparse_max = {name: max_sequence_length for name in sparse_feats}
-            loader = loader.map(self._get_pad_fn(sparse_max))
-
-        DLDataLoader.__init__(
-            self,
-            loader,
-            collate_fn=collate_fn,
-            batch_size=self.batch_size,
-            drop_last=self.drop_last,
-        )
         self.schema = schema
-        self.max_sequence_length = max_sequence_length
+        self._device_id = device
 
-    @staticmethod
-    def _get_pad_fn(padding_lengths):
-        def pad_fn(x, y):
-            new_x = pad_batch(x, padding_lengths)
-            if y is not None and isinstance(y, dict):
-                new_y = pad_batch(y, padding_lengths)
-            else:
-                new_y = y
-            return new_x, new_y
+        # --- resolve file paths ------------------------------------------------
+        paths = self._resolve_paths(paths_or_dataset)
 
-        return pad_fn
-
-    @staticmethod
-    def _augment_schema(
-        schema,
-        cats=None,
-        conts=None,
-        labels=None,
-        lists=None,
-    ):
+        # --- column lists ------------------------------------------------------
         cats = cats or []
         conts = conts or []
-        labels = labels or []
+        labels_list = [labels] if isinstance(labels, str) else (labels or [])
+        lists = lists or []
+        cols_to_read = list(dict.fromkeys(cats + conts + labels_list + lists))  # unique, ordered
 
-        schema = schema.select_by_name(conts + cats + labels + lists)
+        # --- build torch Dataset -----------------------------------------------
+        # Prefer GPU-accelerated hipDF path when cudf + cupy are available
+        if dependencies.is_gpu_dataloader_available() and device is not None:
+            try:
+                dataset = _HipDFParquetDataset(
+                    paths,
+                    cols_to_read,
+                    labels_list,
+                    lists,
+                    max_sequence_length or 20,
+                    device=device if isinstance(device, int) else 0,
+                )
+                logger.info("ROCmDataLoader: using GPU-accelerated hipDF backend")
+            except Exception as exc:
+                logger.warning(
+                    "ROCmDataLoader: hipDF backend failed (%s), falling back to PyArrow CPU",
+                    exc,
+                )
+                dataset = _ROCmParquetDataset(
+                    paths, cols_to_read, labels_list, lists,
+                    max_sequence_length or 20,
+                )
+        else:
+            dataset = _ROCmParquetDataset(
+                paths,
+                cols_to_read,
+                labels_list,
+                lists,
+                max_sequence_length or 20,
+            )
 
-        labels = [labels] if isinstance(labels, str) else labels
-        for label in labels:
-            schema[label] = schema[label].with_tags(Tags.TARGET)
-        for label in cats:
-            schema[label] = schema[label].with_tags(Tags.CATEGORICAL)
-        for label in conts:
-            schema[label] = schema[label].with_tags(Tags.CONTINUOUS)
-        for col in lists:
-            schema[col] = schema[col].with_tags(Tags.LIST)
+        # --- distributed sampler for DDP ---------------------------------------
+        sampler = None
+        if global_size is not None and global_size > 1:
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=global_size,
+                rank=global_rank or 0,
+                shuffle=shuffle,
+            )
+            shuffle = False  # sampler handles shuffling
 
-        return schema
+        # --- collate: stack dicts of tensors -----------------------------------
+        def _dict_collate(batch):
+            inputs_batch = {}
+            targets_batch = {}
+            for key in batch[0][0]:
+                inputs_batch[key] = torch.stack([b[0][key] for b in batch])
+            for key in batch[0][1]:
+                targets_batch[key] = torch.stack([b[1][key] for b in batch])
+            return inputs_batch, targets_batch
 
-    def set_dataset(self, buffer_size, engine, reader_kwargs, schema=None):
-        dataset = validate_dataset(
-            self.paths_or_dataset,
-            self.batch_size,
-            buffer_size,
-            engine,
-            reader_kwargs,
+        self._loader = PyTorchDataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle if sampler is None else False,
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=drop_last,
+            collate_fn=_dict_collate,
         )
-        if schema:
-            # set the dataset schema based on the provided one to keep all original information
-            if isinstance(schema, Schema):
-                # convert merlin-standardlib schema to merlin-core schema
-                schema = to_core_schema(schema)
-            dataset.schema = schema
-        self.dataset = dataset
+        # _batch_size is read directly by the Trainer (num_examples)
+        self._batch_size = batch_size
+        self._sampler = sampler
 
+    # ------------------------------------------------------------------
+    # Path resolution
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _resolve_paths(paths_or_dataset):
+        """Turn a path string (possibly with globs) into a list of Parquet files."""
+        if isinstance(paths_or_dataset, (list, tuple)):
+            result = []
+            for p in paths_or_dataset:
+                result.extend(sorted(glob_module.glob(str(p))))
+            return result if result else [str(p) for p in paths_or_dataset]
+        path_str = str(paths_or_dataset)
+        files = sorted(glob_module.glob(path_str))
+        if not files:
+            files = sorted(glob_module.glob(path_str + "/*.parquet"))
+        if not files:
+            files = [path_str]
+        return files
+
+    # ------------------------------------------------------------------
+    # from_schema  (called by Trainer.get_train_dataloader et al.)
+    # ------------------------------------------------------------------
     @classmethod
     def from_schema(
         cls,
-        schema: Schema,
+        schema,
         paths_or_dataset,
         batch_size,
         max_sequence_length=None,
@@ -440,58 +545,331 @@ class MerlinDataLoader(T4RecDataLoader, DLDataLoader):
         categorical_features=None,
         list_features=None,
         targets=None,
-        collate_fn=lambda x: x[0],
+        collate_fn=None,
         shuffle=True,
-        buffer_size=0.06,
-        parts_per_chunk=1,
-        transforms=None,
         **kwargs,
     ):
-        """
-            Instantitates `MerlinDataLoader` from a ``DatasetSchema``.
-        Parameters
-        ----------
-            schema: DatasetSchema
-                Dataset schema
-            paths_or_dataset: Union[str, Dataset]
-                Path to paquet data of Dataset object.
-            batch_size: int
-                batch size of Dataloader.
-        """
-        categorical_features = (
-            categorical_features or schema.select_by_tag(Tags.CATEGORICAL).column_names
-        )
-        continuous_features = (
-            continuous_features or schema.select_by_tag(Tags.CONTINUOUS).column_names
-        )
-        targets = targets or schema.select_by_tag(Tags.TARGET).column_names
-        list_features = list_features or schema.select_by_tag(Tags.LIST).column_names
-        schema = schema.select_by_name(
-            categorical_features + continuous_features + targets + list_features
-        )
-        loader = cls(
+        """Instantiate ``ROCmDataLoader`` from a ``DatasetSchema``."""
+        if Tags is not None and schema is not None:
+            cat_feats = (
+                categorical_features or schema.select_by_tag(Tags.CATEGORICAL).column_names
+            )
+            cont_feats = (
+                continuous_features or schema.select_by_tag(Tags.CONTINUOUS).column_names
+            )
+            tgt_feats = targets or schema.select_by_tag(Tags.TARGET).column_names
+            lst_feats = list_features or schema.select_by_tag(Tags.LIST).column_names
+        else:
+            cat_feats = categorical_features or []
+            cont_feats = continuous_features or []
+            tgt_feats = targets or []
+            lst_feats = list_features or []
+
+        return cls(
             paths_or_dataset,
             batch_size=batch_size,
-            labels=targets,
             max_sequence_length=max_sequence_length,
-            cats=categorical_features,
-            conts=continuous_features,
-            lists=list_features,
-            collate_fn=collate_fn,
-            engine="parquet",
+            cats=cat_feats,
+            conts=cont_feats,
+            labels=tgt_feats,
+            lists=lst_feats,
             shuffle=shuffle,
-            buffer_size=buffer_size,  # how many batches to load at once
-            parts_per_chunk=parts_per_chunk,
             schema=schema,
-            transforms=transforms,
             **kwargs,
         )
 
-        return loader
-
+    # ------------------------------------------------------------------
+    # Iterator / len / device  (Trainer interface)
+    # ------------------------------------------------------------------
     @property
-    def output_schema(self):
-        return self.dataset.output_schema
+    def device(self):
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def __iter__(self):
+        return iter(self._loader)
+
+    def __len__(self):
+        return len(self._loader)
+
+
+# ---------------------------------------------------------------------------
+# Original NVIDIA MerlinDataLoader -- only defined when merlin-dataloader
+# is installed (i.e. CUDA / NVIDIA systems).
+# ---------------------------------------------------------------------------
+if _merlin_loader_available:
+
+    @dataloader_registry.register_with_multiple_names(
+        "merlin_dataloader", "merlin", "nvtabular_dataloader", "nvtabular"
+    )
+    class MerlinDataLoader(T4RecDataLoader, DLDataLoader):
+        """
+        This class extends the [Merlin data loader]
+        (https://github.com/NVIDIA-Merlin/dataloader/blob/stable/merlin/dataloader/torch.py).
+        The data input requires a merlin.io.Dataset or a path to the data files.
+        It also sets the dataset's schema with the necessary properties to prepare the input
+        list features as dense tensors (i.e. padded to the specified `max_sequence_length`).
+        The dense representation is required by the Transformers4Rec input modules.
+
+        Parameters
+        ----------
+        paths_or_dataset: Union[str, merlin.io.Dataset]
+            The dataset to load.
+        batch_size: int
+            The size of each batch to supply to the model.
+        max_sequence_length: int
+            The maximum sequence length to use for padding list columns.
+            By default, `0` is used as the padding index.
+        cats : List[str], optional
+            The list of categorical columns in the dataset.
+            By default None.
+        conts: List[str], optional
+            The list of continuous columns in the dataset.
+            By default None.
+        labels : List[str], optional
+            The list of label columns in the dataset.
+            By default None.
+        lists : List[str], optional
+            The list of sequential columns in the dataset.
+            By default None.
+        shuffle : bool, optional
+            Enable/disable shuffling of dataset.
+            By default False.
+        parts_per_chunk : int, optional
+            The number of partitions from the iterator, an Merlin Dataset,
+            to concatenate into a "chunk". By default 1.
+        device : int, optional
+            The device id of the selected GPU
+            By default None.
+        drop_last: bool, optional
+            Whether or not to drop the last batch in an epoch. This is useful when you need to
+            guarantee that each batch contains exactly `batch_size` rows - since the last batch
+            will usually contain fewer rows.
+        seed_fn: callable
+            Function used to initialize random state
+        parts_per_chunk: int
+            Number of dataset partitions with size dictated by `buffer_size`
+            to load and concatenate asynchronously. More partitions leads to
+            better epoch-level randomness but can negatively impact throughput
+        global_size: int, optional
+            When doing distributed training, this indicates the number of total processes that are
+            training the model.
+        global_rank: int, optional
+            When doing distributed training, this indicates the local rank for the current process.
+        schema: Schema, optional
+             The `Schema` with the input features.
+        reader_kwargs:
+            Extra arguments to pass to the merlin.io.Dataset object, when the path to data files
+            is provided in `paths_or_dataset` argument.
+        row_groups_per_part: bool, optional
+            If true, preserve the group partitions when loading the dataset from parquet files.
+        collate_fn: Callable, optional
+            A processing function to collect and prepare the list samples
+            (tuple of (input, target) Tensor(s)) returned by the Merlin DataLoader.
+        transforms: List[merlin.dag.BaseOperator]
+            A list of operators that the Merlin dataloader applies on top of the loaded
+            batch, which is a tuple of input and target tensors.
+        """
+
+        def __init__(
+            self,
+            paths_or_dataset,
+            batch_size,
+            max_sequence_length=None,
+            conts=None,
+            cats=None,
+            labels=None,
+            lists=None,
+            collate_fn=lambda x: x[0],
+            engine=None,
+            buffer_size=0.1,
+            reader_kwargs=None,
+            shuffle=False,
+            seed_fn=None,
+            parts_per_chunk=1,
+            device=None,
+            global_size=None,
+            global_rank=None,
+            drop_last=False,
+            schema=None,
+            row_groups_per_part=True,
+            transforms=None,
+            **kwargs,
+        ):
+            T4RecDataLoader.__init__(self)
+
+            self.paths_or_dataset = paths_or_dataset
+            self.batch_size = batch_size
+            self.shuffle = shuffle
+            self.max_sequence_length = max_sequence_length
+            self.drop_last = drop_last
+
+            reader_kwargs = reader_kwargs or {}
+            reader_kwargs["row_groups_per_part"] = row_groups_per_part
+            self.set_dataset(buffer_size, engine, reader_kwargs, schema=schema)
+
+            if (global_rank is not None) and (self.dataset.npartitions < global_size):
+                logger.warning(
+                    "UserWarning: User is advised to repartition the parquet file before training "
+                    "so npartitions>=global_size. Cudf or pandas can be used for repartitioning "
+                    "eg. pdf.to_parquet('file.parquet',row_group_size=N_ROWS/NPARTITIONS) "
+                    "for pandas or "
+                    "gdf.to_parquet('file.parquet',row_group_size_rows=N_ROWS/NPARTITIONS) "
+                    "for cudf so that npartitions=nr_rows/row_group_size. Also ensure "
+                    "npartitions is divisible by number of GPUs to be used "
+                    "(eg. 2 or 4 partitions, if 2 GPUs will be used)."
+                )
+                self.dataset = self.dataset.repartition(npartitions=global_size)
+
+            if (global_rank is not None) and (self.dataset.npartitions % global_size != 0):
+                logger.warning(
+                    f"UserWarning: User is advised to set the number of partitions"
+                    f" ({self.dataset.npartitions}) divisible by the number of available"
+                    f" GPUs ({global_size}). This will divide the work equally among GPUs"
+                    " for DDP training and ensure optimal performance."
+                )
+
+            self.dataset.schema = self._augment_schema(
+                self.dataset.schema,
+                cats=cats,
+                conts=conts,
+                labels=labels,
+                lists=lists,
+            )
+
+            loader = Loader(
+                self.dataset,
+                self.batch_size,
+                shuffle,
+                seed_fn=seed_fn,
+                parts_per_chunk=parts_per_chunk,
+                device=device,
+                global_size=global_size,
+                global_rank=global_rank,
+                drop_last=drop_last,
+                transforms=transforms,
+            )
+            if max_sequence_length:
+                # Apply padding
+                output_schema = loader.output_schema
+                sparse_feats = [col.name for col in output_schema if Tags.LIST in col.tags]
+                sparse_max = {name: max_sequence_length for name in sparse_feats}
+                loader = loader.map(self._get_pad_fn(sparse_max))
+
+            DLDataLoader.__init__(
+                self,
+                loader,
+                collate_fn=collate_fn,
+                batch_size=self.batch_size,
+                drop_last=self.drop_last,
+            )
+            self.schema = schema
+            self.max_sequence_length = max_sequence_length
+
+        @staticmethod
+        def _get_pad_fn(padding_lengths):
+            def pad_fn(x, y):
+                new_x = pad_batch(x, padding_lengths)
+                if y is not None and isinstance(y, dict):
+                    new_y = pad_batch(y, padding_lengths)
+                else:
+                    new_y = y
+                return new_x, new_y
+
+            return pad_fn
+
+        @staticmethod
+        def _augment_schema(
+            schema,
+            cats=None,
+            conts=None,
+            labels=None,
+            lists=None,
+        ):
+            cats = cats or []
+            conts = conts or []
+            labels = labels or []
+
+            schema = schema.select_by_name(conts + cats + labels + lists)
+
+            labels = [labels] if isinstance(labels, str) else labels
+            for label in labels:
+                schema[label] = schema[label].with_tags(Tags.TARGET)
+            for label in cats:
+                schema[label] = schema[label].with_tags(Tags.CATEGORICAL)
+            for label in conts:
+                schema[label] = schema[label].with_tags(Tags.CONTINUOUS)
+            for col in lists:
+                schema[col] = schema[col].with_tags(Tags.LIST)
+
+            return schema
+
+        def set_dataset(self, buffer_size, engine, reader_kwargs, schema=None):
+            dataset = validate_dataset(
+                self.paths_or_dataset,
+                self.batch_size,
+                buffer_size,
+                engine,
+                reader_kwargs,
+            )
+            if schema:
+                if isinstance(schema, Schema):
+                    schema = to_core_schema(schema)
+                dataset.schema = schema
+            self.dataset = dataset
+
+        @classmethod
+        def from_schema(
+            cls,
+            schema,
+            paths_or_dataset,
+            batch_size,
+            max_sequence_length=None,
+            continuous_features=None,
+            categorical_features=None,
+            list_features=None,
+            targets=None,
+            collate_fn=lambda x: x[0],
+            shuffle=True,
+            buffer_size=0.06,
+            parts_per_chunk=1,
+            transforms=None,
+            **kwargs,
+        ):
+            """Instantiate ``MerlinDataLoader`` from a ``DatasetSchema``."""
+            categorical_features = (
+                categorical_features or schema.select_by_tag(Tags.CATEGORICAL).column_names
+            )
+            continuous_features = (
+                continuous_features or schema.select_by_tag(Tags.CONTINUOUS).column_names
+            )
+            targets = targets or schema.select_by_tag(Tags.TARGET).column_names
+            list_features = list_features or schema.select_by_tag(Tags.LIST).column_names
+            schema = schema.select_by_name(
+                categorical_features + continuous_features + targets + list_features
+            )
+            loader = cls(
+                paths_or_dataset,
+                batch_size=batch_size,
+                labels=targets,
+                max_sequence_length=max_sequence_length,
+                cats=categorical_features,
+                conts=continuous_features,
+                lists=list_features,
+                collate_fn=collate_fn,
+                engine="parquet",
+                shuffle=shuffle,
+                buffer_size=buffer_size,
+                parts_per_chunk=parts_per_chunk,
+                schema=schema,
+                transforms=transforms,
+                **kwargs,
+            )
+
+            return loader
+
+        @property
+        def output_schema(self):
+            return self.dataset.output_schema
 
 
 class ParquetDataset(Dataset):
@@ -542,4 +920,9 @@ class ShuffleDataset(IterableDataset):
 
 
 def to_core_schema(t4rec_schema):
+    if TensorflowMetadata is None:
+        raise ImportError(
+            "merlin-core is required for schema conversion. "
+            "Install it with: pip install merlin-core"
+        )
     return TensorflowMetadata.from_json(t4rec_schema.to_json()).to_merlin_schema()
