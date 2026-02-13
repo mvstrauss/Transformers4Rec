@@ -585,6 +585,11 @@ class ROCmDataLoader(T4RecDataLoader):
     def device(self):
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    @property
+    def dataset(self):
+        """Expose the underlying torch Dataset (needed by Trainer.evaluation_loop)."""
+        return self._loader.dataset
+
     def __iter__(self):
         return iter(self._loader)
 
