@@ -438,7 +438,14 @@ class _HipDFBatchIterator:
     @staticmethod
     def _prep_scalar(series, cp, torch_dev):
         """Scalar column -> 1-D GPU tensor via zero-copy DLPack."""
-        cp_arr = cp.asarray(series.values)
+        try:
+            cp_arr = cp.asarray(series.values)
+        except Exception:
+            # Fallback for dtypes cupy can't handle (strings, datetime, etc.)
+            np_arr = series.to_pandas().values
+            if np_arr.dtype.kind == "f":
+                return torch.tensor(np_arr, dtype=torch.float32, device=torch_dev)
+            return torch.tensor(np_arr.astype("int64"), dtype=torch.long, device=torch_dev)
         if cp_arr.dtype.kind == "f":
             cp_arr = cp_arr.astype(cp.float32)
         else:
@@ -450,10 +457,17 @@ class _HipDFBatchIterator:
 
         Uses cudf list internals (flat leaves + offsets) to scatter values
         into a zero-padded output matrix on GPU.
+
+        Note: hipDF exposes offsets on the underlying ``ListColumn`` object
+        (``series._column.offsets``), **not** on the ``ListMethods`` accessor
+        (``series.list``).
         """
         n = len(series)
-        leaves = cp.asarray(series.list.leaves.values)
-        offsets = cp.asarray(series.list.offsets).get()  # small, move to CPU
+        leaves_vals = series.list.leaves.values          # cudf buffer -> cupy
+        leaves = cp.asarray(leaves_vals)
+        # offsets live on the column, not on the .list accessor
+        offsets_col = series._column.offsets
+        offsets = cp.asarray(offsets_col.values).get()    # small, move to CPU
 
         out_dtype = cp.float32 if leaves.dtype.kind == "f" else cp.int64
         leaves = leaves.astype(out_dtype)
