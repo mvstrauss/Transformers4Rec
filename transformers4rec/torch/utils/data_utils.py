@@ -380,16 +380,19 @@ class _HipDFParquetDataset(Dataset):
             return torch.tensor(value)
 
 
-class _HipDFBatchIterator:
-    """GPU-batch-level iterator over a cudf DataFrame.
+class _GPUBatchIterator:
+    """GPU-batch-level iterator that pre-converts a pandas DataFrame to
+    GPU-resident PyTorch tensors at init time, then yields
+    ``(inputs_dict, targets_dict)`` batches using pure tensor indexing.
 
-    Pre-converts all columns to GPU-resident PyTorch tensors at init time,
-    then yields ``(inputs_dict, targets_dict)`` batches using pure tensor
-    indexing -- no per-row cudf overhead during iteration.
+    This implementation requires **only** PyArrow, pandas, NumPy, and
+    PyTorch -- no ``cudf`` or ``cupy`` dependency.  Data flows through:
 
-    Scalar columns use zero-copy DLPack (cudf -> cupy -> torch).
-    List columns are pre-padded/trimmed to ``max_seq_len`` and stored as
-    2-D tensors ``(num_rows, max_seq_len)`` on GPU.
+        Parquet  --(PyArrow)--> pandas  --(numpy)--> torch GPU tensors
+
+    Scalar columns are transferred as contiguous 1-D tensors.
+    List columns are flattened, padded / trimmed to ``max_seq_len``, and
+    stored as 2-D tensors ``(num_rows, max_seq_len)`` on GPU.
     """
 
     def __init__(
@@ -397,8 +400,6 @@ class _HipDFBatchIterator:
         batch_size, shuffle=False, drop_last=False, device=0,
         global_size=None, global_rank=None,
     ):
-        import cupy as cp
-
         self.target_names = set(target_names)
         self.list_cols = set(list_cols)
         self.batch_size = batch_size
@@ -410,14 +411,14 @@ class _HipDFBatchIterator:
 
         torch_dev = torch.device(f"cuda:{device}")
 
-        # -- one-time bulk conversion: cudf columns -> GPU tensors -------------
+        # -- one-time bulk conversion: pandas columns -> GPU tensors -----------
         self._tensors = {}
         for col in cols_to_read:
             series = data[col]
             if col in self.list_cols:
-                self._tensors[col] = self._prep_list(series, cp, torch_dev)
+                self._tensors[col] = self._prep_list(series, torch_dev)
             else:
-                self._tensors[col] = self._prep_scalar(series, cp, torch_dev)
+                self._tensors[col] = self._prep_scalar(series, torch_dev)
 
         self._num_rows = len(data)
 
@@ -436,58 +437,85 @@ class _HipDFBatchIterator:
     # Column pre-processing (called once at init)
     # ------------------------------------------------------------------
     @staticmethod
-    def _prep_scalar(series, cp, torch_dev):
-        """Scalar column -> 1-D GPU tensor via zero-copy DLPack."""
-        try:
-            cp_arr = cp.asarray(series.values)
-        except Exception:
-            # Fallback for dtypes cupy can't handle (strings, datetime, etc.)
-            np_arr = series.to_pandas().values
-            if np_arr.dtype.kind == "f":
-                return torch.tensor(np_arr, dtype=torch.float32, device=torch_dev)
-            return torch.tensor(np_arr.astype("int64"), dtype=torch.long, device=torch_dev)
-        if cp_arr.dtype.kind == "f":
-            cp_arr = cp_arr.astype(cp.float32)
-        else:
-            cp_arr = cp_arr.astype(cp.int64)
-        return torch.from_dlpack(cp_arr)
+    def _prep_scalar(series, torch_dev):
+        """Scalar column -> 1-D GPU tensor (copies from CPU to GPU)."""
+        np_arr = np.asarray(series)
+        if np_arr.dtype.kind in ("O", "U", "S"):
+            # Object / string columns -- try numeric conversion
+            try:
+                np_arr = np_arr.astype(np.float64)
+            except (ValueError, TypeError):
+                np_arr = np.arange(len(np_arr), dtype=np.int64)
+        if np_arr.dtype.kind == "f":
+            return torch.tensor(
+                np_arr.astype(np.float32, copy=False),
+                dtype=torch.float32,
+                device=torch_dev,
+            )
+        return torch.tensor(
+            np_arr.astype(np.int64, copy=False),
+            dtype=torch.long,
+            device=torch_dev,
+        )
 
-    def _prep_list(self, series, cp, torch_dev):
-        """List/sequence column -> 2-D GPU tensor (num_rows, max_seq_len).
+    def _prep_list(self, series, torch_dev):
+        """List/sequence column -> 2-D GPU tensor ``(num_rows, max_seq_len)``.
 
-        Uses cudf list internals (flat leaves + offsets) to scatter values
-        into a zero-padded output matrix on GPU.
-
-        Note: hipDF exposes offsets on the underlying ``ListColumn`` object
-        (``series._column.offsets``), **not** on the ``ListMethods`` accessor
-        (``series.list``).
+        Flattens all per-row lists into a single numpy array, computes
+        offsets, transfers to GPU, then scatters into a zero-padded matrix.
         """
         n = len(series)
-        leaves_vals = series.list.leaves.values          # cudf buffer -> cupy
-        leaves = cp.asarray(leaves_vals)
-        # offsets live on the column, not on the .list accessor
-        offsets_col = series._column.offsets
-        offsets = cp.asarray(offsets_col.values).get()    # small, move to CPU
 
-        out_dtype = cp.float32 if leaves.dtype.kind == "f" else cp.int64
-        leaves = leaves.astype(out_dtype)
-        out = cp.zeros((n, self.max_seq_len), dtype=out_dtype)
+        # Flatten lists + compute offsets on CPU (cheap metadata work)
+        flat_parts = []
+        offsets = [0]
+        for lst in series:
+            if isinstance(lst, (list, np.ndarray)):
+                arr = np.asarray(lst)
+            elif lst is None or (isinstance(lst, float) and np.isnan(lst)):
+                arr = np.array([], dtype=np.int64)
+            else:
+                arr = np.array([lst])
+            flat_parts.append(arr)
+            offsets.append(offsets[-1] + len(arr))
 
-        # Build scatter indices on CPU (cheap -- only offset metadata)
-        row_idx, col_idx, src_idx = [], [], []
-        for i in range(n):
-            s, e = int(offsets[i]), int(offsets[i + 1])
-            length = min(e - s, self.max_seq_len)
-            if length > 0:
-                row_idx.extend([i] * length)
-                col_idx.extend(range(length))
-                src_idx.extend(range(s, s + length))
+        if flat_parts and sum(len(p) for p in flat_parts) > 0:
+            all_vals = np.concatenate(flat_parts)
+        else:
+            all_vals = np.array([], dtype=np.int64)
 
-        if row_idx:
-            # Single bulk GPU scatter
-            out[cp.array(row_idx), cp.array(col_idx)] = leaves[cp.array(src_idx)]
+        # Determine output dtype
+        if all_vals.dtype.kind == "f":
+            torch_dtype = torch.float32
+            all_vals = all_vals.astype(np.float32, copy=False)
+        else:
+            torch_dtype = torch.long
+            all_vals = all_vals.astype(np.int64, copy=False)
 
-        return torch.from_dlpack(out)
+        # Allocate zero-padded output on GPU
+        out = torch.zeros((n, self.max_seq_len), dtype=torch_dtype, device=torch_dev)
+
+        # Transfer flat values to GPU
+        if len(all_vals) > 0:
+            vals_gpu = torch.tensor(all_vals, dtype=torch_dtype, device=torch_dev)
+
+            # Build scatter indices on CPU (cheap -- only offset metadata)
+            row_idx, col_idx, src_idx = [], [], []
+            for i in range(n):
+                s, e = offsets[i], offsets[i + 1]
+                length = min(e - s, self.max_seq_len)
+                if length > 0:
+                    row_idx.extend([i] * length)
+                    col_idx.extend(range(length))
+                    src_idx.extend(range(s, s + length))
+
+            if row_idx:
+                row_t = torch.tensor(row_idx, dtype=torch.long, device=torch_dev)
+                col_t = torch.tensor(col_idx, dtype=torch.long, device=torch_dev)
+                src_t = torch.tensor(src_idx, dtype=torch.long, device=torch_dev)
+                out[row_t, col_t] = vals_gpu[src_t]
+
+        return out
 
     # ------------------------------------------------------------------
     # Iteration
@@ -517,6 +545,10 @@ class _HipDFBatchIterator:
                 else:
                     inputs[col] = t
             yield inputs, targets
+
+
+# Keep the old name as an alias for backwards compatibility
+_HipDFBatchIterator = _GPUBatchIterator
 
 
 @dataloader_registry.register_with_multiple_names("rocm_dataloader", "rocm")
@@ -594,16 +626,29 @@ class ROCmDataLoader(T4RecDataLoader):
         cols_to_read = list(dict.fromkeys(cats + conts + labels_list + lists))  # unique, ordered
 
         # --- build backend -----------------------------------------------------
-        # Prefer GPU-accelerated hipDF batch iterator when cudf + cupy available
-        if dependencies.is_gpu_dataloader_available() and device is not None:
+        # Prefer GPU batch iterator when a CUDA/ROCm device is available.
+        # Priority: cudf (GPU-resident read) > PyArrow+pandas (CPU read, GPU tensors)
+        if device is not None and torch.cuda.is_available():
             try:
-                import cudf
+                import pandas as pd
 
-                frames = [cudf.read_parquet(p, columns=cols_to_read or None)
-                          for p in paths]
-                data = cudf.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+                # Try cudf first (hipDF on ROCm) for GPU-resident parquet read
+                try:
+                    import cudf
+                    frames = [cudf.read_parquet(p, columns=cols_to_read or None)
+                              for p in paths]
+                    data = cudf.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+                    # cudf DataFrames expose .to_pandas(); convert for _GPUBatchIterator
+                    data = data.to_pandas()
+                    logger.info("ROCmDataLoader: read parquet via cudf (GPU)")
+                except ImportError:
+                    # cudf not available -- fall back to PyArrow (CPU read)
+                    frames = [pq.read_table(p, columns=cols_to_read or None).to_pandas()
+                              for p in paths]
+                    data = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+                    logger.info("ROCmDataLoader: read parquet via PyArrow (CPU)")
 
-                self._loader = _HipDFBatchIterator(
+                self._loader = _GPUBatchIterator(
                     data,
                     cols_to_read,
                     labels_list,
@@ -616,14 +661,15 @@ class ROCmDataLoader(T4RecDataLoader):
                     global_size=global_size,
                     global_rank=global_rank,
                 )
-                del data  # free cudf DataFrame; tensors live on GPU now
+                del data  # free DataFrame; tensors live on GPU now
                 self._batch_size = batch_size
                 self._sampler = None
-                logger.info("ROCmDataLoader: using GPU-accelerated hipDF batch iterator")
+                logger.info("ROCmDataLoader: using GPU batch iterator (device=%s)", device)
                 return  # done -- skip CPU path below
             except Exception as exc:
                 logger.warning(
-                    "ROCmDataLoader: hipDF backend failed (%s), falling back to PyArrow CPU",
+                    "ROCmDataLoader: GPU batch iterator failed (%s), "
+                    "falling back to PyArrow CPU DataLoader",
                     exc,
                 )
 

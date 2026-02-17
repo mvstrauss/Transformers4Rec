@@ -14,13 +14,21 @@
 # limitations under the License.
 #
 def is_gpu_dataloader_available() -> bool:
+    """Check if the GPU-accelerated dataloader path is available.
+
+    The GPU batch iterator only needs PyTorch with CUDA/ROCm support.
+    It reads parquet via PyArrow into pandas, then transfers data to
+    GPU tensors using plain PyTorch -- no cudf or cupy required.
+
+    If cudf/cupy *are* installed (hipDF on ROCm, or RAPIDS on CUDA),
+    they will be used opportunistically for GPU-resident parquet reads,
+    but they are not required.
+    """
     try:
-        import cudf
-        import cupy
+        import torch
+        return torch.cuda.is_available()
     except ImportError:
-        cudf = None
-        cupy = None
-    return cudf is not None and cupy is not None
+        return False
 
 
 def is_pyarrow_available() -> bool:
