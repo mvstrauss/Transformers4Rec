@@ -26,25 +26,53 @@ def is_gpu_dataloader_available() -> bool:
     """
     try:
         import torch
+
         return torch.cuda.is_available()
+    except ImportError:
+        return False
+
+
+def is_hipdf_available() -> bool:
+    """Check if hipDF (cudf) and cupy are both importable.
+
+    When both are present the dataloader can read Parquet directly into
+    GPU memory and convert columns to PyTorch tensors via DLPack
+    (zero-copy), bypassing the CPU entirely.
+
+    hipDF exposes itself as ``cudf`` at import time, so we test for
+    ``import cudf`` plus ``import cupy``.
+
+    Set the environment variable ``T4REC_DISABLE_HIPDF=1`` to force-skip
+    the hipDF path even when the packages are installed (useful for A/B
+    testing against the PyArrow+PyTorch GPU batch iterator).
+    """
+    import os
+
+    if os.environ.get("T4REC_DISABLE_HIPDF", "0") == "1":
+        return False
+    try:
+        import cudf  # noqa: F401
+        import cupy  # noqa: F401
+
+        return True
     except ImportError:
         return False
 
 
 def is_pyarrow_available() -> bool:
     try:
-        import pyarrow
+        import pyarrow  # noqa: F401
     except ImportError:
-        pyarrow = None
-    return pyarrow is not None
+        return False
+    return True
 
 
 def is_merlin_dataloader_available() -> bool:
     try:
-        import merlin.dataloader
+        import merlin.dataloader  # noqa: F401
     except ImportError:
-        merlin.dataloader = None
-    return merlin.dataloader is not None
+        return False
+    return True
 
 
 def is_rocm_available() -> bool:
