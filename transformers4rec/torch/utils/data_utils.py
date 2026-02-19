@@ -776,15 +776,24 @@ class ROCmDataLoader(T4RecDataLoader):
                     )
                     self._batch_size = batch_size
                     self._sampler = None
+                    self._tier = "tier1_hipdf"
                     logger.info(
                         "ROCmDataLoader: using hipDF batch iterator "
                         "(GPU-native, device=%s)", device,
+                    )
+                    print(
+                        f"[ROCmDataLoader] Tier 1 active: hipDF GPU-native "
+                        f"(device={device})", flush=True,
                     )
                     return
                 except Exception as exc:
                     logger.warning(
                         "ROCmDataLoader: hipDF batch iterator failed (%s), "
                         "trying PyArrow GPU path", exc,
+                    )
+                    print(
+                        f"[ROCmDataLoader] Tier 1 (hipDF) failed: {exc}; "
+                        f"trying Tier 2", flush=True,
                     )
 
             # -- Tier 2: PyArrow -> pandas -> GPU tensors -----------------------
@@ -800,7 +809,6 @@ class ROCmDataLoader(T4RecDataLoader):
                     if len(frames) > 1
                     else frames[0]
                 )
-                logger.info("ROCmDataLoader: read parquet via PyArrow (CPU)")
 
                 self._loader = _GPUBatchIterator(
                     data, cols_to_read, labels_list, lists, msl,
@@ -811,15 +819,25 @@ class ROCmDataLoader(T4RecDataLoader):
                 del data
                 self._batch_size = batch_size
                 self._sampler = None
+                self._tier = "tier2_gpu_batch"
                 logger.info(
                     "ROCmDataLoader: using GPU batch iterator (device=%s)",
                     device,
+                )
+                print(
+                    f"[ROCmDataLoader] Tier 2 active: GPU batch iterator "
+                    f"(PyArrow->pandas->GPU, device={device}, "
+                    f"rows={len(self._loader)})", flush=True,
                 )
                 return
             except Exception as exc:
                 logger.warning(
                     "ROCmDataLoader: GPU batch iterator failed (%s), "
                     "falling back to CPU DataLoader", exc,
+                )
+                print(
+                    f"[ROCmDataLoader] Tier 2 (GPU batch) failed: {exc}; "
+                    f"falling back to Tier 3 (CPU)", flush=True,
                 )
 
         # -- Tier 3: CPU / PyArrow fallback -------------------------------------
@@ -858,6 +876,12 @@ class ROCmDataLoader(T4RecDataLoader):
         )
         self._batch_size = batch_size
         self._sampler = sampler
+        self._tier = "tier3_cpu"
+        print(
+            f"[ROCmDataLoader] Tier 3 active: CPU DataLoader "
+            f"(PyArrow, num_workers={num_workers}, "
+            f"rows={len(dataset)})", flush=True,
+        )
 
     # ------------------------------------------------------------------
     # Path resolution
