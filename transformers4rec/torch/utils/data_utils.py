@@ -16,6 +16,7 @@
 
 import glob as glob_module
 import logging
+import os
 import warnings
 from abc import ABC
 
@@ -684,6 +685,209 @@ class _HipDFBatchIterator:
             yield inputs, targets
 
 
+class _StreamingGPUBatchIterator:
+    """Streaming GPU batch iterator for datasets that exceed GPU memory.
+
+    Reads Parquet data in chunks of row-groups, converts each chunk to GPU
+    tensors via ``_GPUBatchIterator``, and yields batches.  A background
+    thread prefetches the next chunk's Parquet read while the current chunk
+    is being iterated on GPU.
+
+    DDP
+        Assigns contiguous blocks of Parquet row-groups to each rank so
+        every rank reads a disjoint subset of the data with minimal file
+        opens.
+
+    Shuffle
+        Per-epoch chunk-order shuffle plus within-chunk row-level shuffle
+        (handled by ``_GPUBatchIterator``).
+    """
+
+    def __init__(
+        self, paths, cols_to_read, target_names, list_cols, max_seq_len,
+        batch_size, shuffle=False, drop_last=False, device=0,
+        global_size=None, global_rank=None,
+        rows_per_chunk=None, prefetch=True,
+    ):
+        self.cols_to_read = cols_to_read
+        self.target_names = (
+            list(target_names) if not isinstance(target_names, list)
+            else target_names
+        )
+        self.list_cols = (
+            list(list_cols) if not isinstance(list_cols, list) else list_cols
+        )
+        self.max_seq_len = max_seq_len
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.device = device
+        self.prefetch = prefetch
+        self._epoch = 0
+
+        # Scan Parquet metadata — no data is loaded here.
+        all_rgs = []
+        for p in paths:
+            pf = pq.ParquetFile(p)
+            for rg_idx in range(pf.metadata.num_row_groups):
+                rg_meta = pf.metadata.row_group(rg_idx)
+                all_rgs.append((p, rg_idx, rg_meta.num_rows))
+
+        if not all_rgs:
+            raise ValueError(
+                f"No Parquet row-groups found in {len(paths)} path(s)"
+            )
+
+        # DDP: assign contiguous blocks of row-groups to this rank.
+        if global_size and global_size > 1:
+            rank = global_rank or 0
+            n = len(all_rgs)
+            start = rank * n // global_size
+            end = (rank + 1) * n // global_size
+            rank_rgs = all_rgs[start:end]
+        else:
+            rank_rgs = all_rgs
+
+        self._total_rows = sum(nr for _, _, nr in rank_rgs)
+
+        # Auto-size chunks: target roughly 4 GB GPU footprint per chunk.
+        if rows_per_chunk is None:
+            n_list = len(self.list_cols)
+            n_scalar = max(len(cols_to_read) - n_list, 0)
+            bytes_per_row = n_list * max_seq_len * 6 + n_scalar * 8
+            target_bytes = 4 * 1024 ** 3
+            rows_per_chunk = max(
+                10_000, int(target_bytes / max(bytes_per_row, 1))
+            )
+
+        # Group row-groups into chunks.
+        self._chunks = []
+        current_chunk = []
+        current_rows = 0
+        for rg in rank_rgs:
+            current_chunk.append(rg)
+            current_rows += rg[2]
+            if current_rows >= rows_per_chunk:
+                self._chunks.append(current_chunk)
+                current_chunk = []
+                current_rows = 0
+        if current_chunk:
+            self._chunks.append(current_chunk)
+
+        # Pre-compute __len__ once.
+        if self.drop_last:
+            self._n_batches = self._total_rows // self.batch_size
+        else:
+            self._n_batches = 0
+            for chunk_rgs in self._chunks:
+                cr = sum(nr for _, _, nr in chunk_rgs)
+                self._n_batches += (cr + self.batch_size - 1) // self.batch_size
+
+        self.dataset = self  # HF Trainer compatibility
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+    def set_epoch(self, epoch):
+        self._epoch = epoch
+
+    def __len__(self):
+        return self._n_batches
+
+    # ------------------------------------------------------------------
+    # Chunk I/O
+    # ------------------------------------------------------------------
+    def _read_chunk(self, chunk_rgs):
+        """Read a list of row-groups into a single pandas DataFrame."""
+        import pandas as pd
+
+        frames = []
+        sorted_rgs = sorted(chunk_rgs, key=lambda r: (r[0], r[1]))
+        current_path = None
+        current_pf = None
+        for path, rg_idx, _ in sorted_rgs:
+            if path != current_path:
+                current_pf = pq.ParquetFile(path)
+                current_path = path
+            table = current_pf.read_row_group(
+                rg_idx, columns=self.cols_to_read or None,
+            )
+            frames.append(table.to_pandas())
+        if len(frames) > 1:
+            return pd.concat(frames, ignore_index=True)
+        return frames[0] if frames else pd.DataFrame()
+
+    def _make_chunk_iter(self, data):
+        """Create a _GPUBatchIterator for one chunk of in-memory data."""
+        it = _GPUBatchIterator(
+            data, self.cols_to_read, self.target_names, self.list_cols,
+            self.max_seq_len, self.batch_size,
+            shuffle=self.shuffle, drop_last=False, device=self.device,
+        )
+        it.set_epoch(self._epoch)
+        return it
+
+    # ------------------------------------------------------------------
+    # Iteration
+    # ------------------------------------------------------------------
+    def __iter__(self):
+        chunk_order = list(range(len(self._chunks)))
+        if self.shuffle:
+            rng = np.random.RandomState(self._epoch + 42)
+            rng.shuffle(chunk_order)
+
+        max_batches = (
+            self._total_rows // self.batch_size if self.drop_last else None
+        )
+
+        if self.prefetch and len(chunk_order) > 1:
+            yield from self._iter_prefetch(chunk_order, max_batches)
+        else:
+            yield from self._iter_simple(chunk_order, max_batches)
+
+    def _iter_simple(self, chunk_order, max_batches):
+        batches = 0
+        for ci in chunk_order:
+            data = self._read_chunk(self._chunks[ci])
+            chunk_it = self._make_chunk_iter(data)
+            del data
+            for batch in chunk_it:
+                yield batch
+                batches += 1
+                if max_batches and batches >= max_batches:
+                    del chunk_it
+                    torch.cuda.empty_cache()
+                    return
+            del chunk_it
+            torch.cuda.empty_cache()
+
+    def _iter_prefetch(self, chunk_order, max_batches):
+        from concurrent.futures import ThreadPoolExecutor
+
+        batches = 0
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                self._read_chunk, self._chunks[chunk_order[0]],
+            )
+            for i, ci in enumerate(chunk_order):
+                data = future.result()
+                if i + 1 < len(chunk_order):
+                    future = pool.submit(
+                        self._read_chunk, self._chunks[chunk_order[i + 1]],
+                    )
+                chunk_it = self._make_chunk_iter(data)
+                del data
+                for batch in chunk_it:
+                    yield batch
+                    batches += 1
+                    if max_batches and batches >= max_batches:
+                        del chunk_it
+                        torch.cuda.empty_cache()
+                        return
+                del chunk_it
+                torch.cuda.empty_cache()
+
+
 @dataloader_registry.register_with_multiple_names("rocm_dataloader", "rocm")
 class ROCmDataLoader(T4RecDataLoader):
     """
@@ -739,6 +943,8 @@ class ROCmDataLoader(T4RecDataLoader):
         schema=None,
         num_workers=2,
         pin_memory=True,
+        streaming=None,
+        rows_per_chunk=None,
         **kwargs,
     ):
         T4RecDataLoader.__init__(self)
@@ -796,7 +1002,60 @@ class ROCmDataLoader(T4RecDataLoader):
                         f"trying Tier 2", flush=True,
                     )
 
-            # -- Tier 2: PyArrow -> pandas -> GPU tensors -----------------------
+            # -- Tier 2a: Streaming GPU (for large datasets) -------------------
+            _use_streaming = streaming
+            if _use_streaming is None:
+                try:
+                    total_rows = sum(
+                        pq.ParquetFile(p).metadata.num_rows for p in paths
+                    )
+                    n_list = len(lists)
+                    est_bytes = total_rows * (
+                        n_list * msl * 6
+                        + max(len(cols_to_read) - n_list, 0) * 8
+                    )
+                    gpu_total = torch.cuda.get_device_properties(
+                        dev_int
+                    ).total_memory
+                    _use_streaming = est_bytes > gpu_total * 0.4
+                except Exception:
+                    _use_streaming = False
+
+            if _use_streaming:
+                try:
+                    self._loader = _StreamingGPUBatchIterator(
+                        paths, cols_to_read, labels_list, lists, msl,
+                        batch_size, shuffle=shuffle, drop_last=drop_last,
+                        device=dev_int,
+                        global_size=global_size, global_rank=global_rank,
+                        rows_per_chunk=rows_per_chunk, prefetch=True,
+                    )
+                    self._batch_size = batch_size
+                    self._sampler = None
+                    self._tier = "tier2a_streaming_gpu"
+                    logger.info(
+                        "ROCmDataLoader: using streaming GPU iterator "
+                        "(device=%s)", device,
+                    )
+                    print(
+                        f"[ROCmDataLoader] Tier 2a active: streaming GPU "
+                        f"iterator (device={device}, "
+                        f"chunks={len(self._loader._chunks)}, "
+                        f"total_rows={self._loader._total_rows:,})",
+                        flush=True,
+                    )
+                    return
+                except Exception as exc:
+                    logger.warning(
+                        "ROCmDataLoader: streaming GPU iterator failed "
+                        "(%s), trying in-memory GPU path", exc,
+                    )
+                    print(
+                        f"[ROCmDataLoader] Tier 2a (streaming) failed: "
+                        f"{exc}; trying Tier 2b", flush=True,
+                    )
+
+            # -- Tier 2b: PyArrow -> pandas -> GPU tensors (all in memory) -----
             try:
                 import pandas as pd
 
@@ -819,13 +1078,13 @@ class ROCmDataLoader(T4RecDataLoader):
                 del data
                 self._batch_size = batch_size
                 self._sampler = None
-                self._tier = "tier2_gpu_batch"
+                self._tier = "tier2b_gpu_batch"
                 logger.info(
                     "ROCmDataLoader: using GPU batch iterator (device=%s)",
                     device,
                 )
                 print(
-                    f"[ROCmDataLoader] Tier 2 active: GPU batch iterator "
+                    f"[ROCmDataLoader] Tier 2b active: GPU batch iterator "
                     f"(PyArrow->pandas->GPU, device={device}, "
                     f"rows={len(self._loader)})", flush=True,
                 )
@@ -836,7 +1095,7 @@ class ROCmDataLoader(T4RecDataLoader):
                     "falling back to CPU DataLoader", exc,
                 )
                 print(
-                    f"[ROCmDataLoader] Tier 2 (GPU batch) failed: {exc}; "
+                    f"[ROCmDataLoader] Tier 2b (GPU batch) failed: {exc}; "
                     f"falling back to Tier 3 (CPU)", flush=True,
                 )
 
@@ -888,13 +1147,31 @@ class ROCmDataLoader(T4RecDataLoader):
     # ------------------------------------------------------------------
     @staticmethod
     def _resolve_paths(paths_or_dataset):
-        """Turn a path string (possibly with globs) into a list of Parquet files."""
+        """Turn a path string (possibly with globs) into a list of Parquet files.
+
+        Handles directories by expanding them to ``*.parquet`` inside, so that
+        downstream consumers (e.g. ``pq.ParquetFile``) never receive a bare
+        directory path.
+        """
+
+        def _expand(p):
+            p_str = str(p)
+            if os.path.isdir(p_str):
+                pq_files = sorted(glob_module.glob(os.path.join(p_str, "*.parquet")))
+                return pq_files if pq_files else [p_str]
+            return sorted(glob_module.glob(p_str)) or [p_str]
+
         if isinstance(paths_or_dataset, (list, tuple)):
             result = []
             for p in paths_or_dataset:
-                result.extend(sorted(glob_module.glob(str(p))))
+                result.extend(_expand(p))
             return result if result else [str(p) for p in paths_or_dataset]
+
         path_str = str(paths_or_dataset)
+        if os.path.isdir(path_str):
+            files = sorted(glob_module.glob(os.path.join(path_str, "*.parquet")))
+            if files:
+                return files
         files = sorted(glob_module.glob(path_str))
         if not files:
             files = sorted(glob_module.glob(path_str + "/*.parquet"))
@@ -918,6 +1195,8 @@ class ROCmDataLoader(T4RecDataLoader):
         targets=None,
         collate_fn=None,
         shuffle=True,
+        streaming=None,
+        rows_per_chunk=None,
         **kwargs,
     ):
         """Instantiate ``ROCmDataLoader`` from a ``DatasetSchema``."""
@@ -946,6 +1225,8 @@ class ROCmDataLoader(T4RecDataLoader):
             lists=lst_feats,
             shuffle=shuffle,
             schema=schema,
+            streaming=streaming,
+            rows_per_chunk=rows_per_chunk,
             **kwargs,
         )
 
