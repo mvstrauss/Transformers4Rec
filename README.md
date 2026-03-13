@@ -1,4 +1,17 @@
-# [Transformers4Rec](https://github.com/NVIDIA-Merlin/Transformers4Rec/)
+# Transformers4Rec — AMD GPU Fork
+
+> **This is a fork of [NVIDIA-Merlin/Transformers4Rec](https://github.com/NVIDIA-Merlin/Transformers4Rec)** that adds full support for AMD Instinct GPUs (ROCm). It replaces the NVIDIA-proprietary Merlin dataloader with a platform-agnostic GPU-native alternative and fixes several CUDA-hardcoded paths, so that the library works out of the box on both AMD and NVIDIA hardware with no code changes.
+>
+> See [AMD_GPU_SUPPORT.md](AMD_GPU_SUPPORT.md) for the full technical details.
+
+| | Upstream | This Fork |
+|---|----------|-----------|
+| AMD ROCm GPUs | Not supported | Fully supported (auto-detected) |
+| NVIDIA CUDA GPUs | Merlin dataloader | Works as-is; new dataloader also available and faster |
+| Dataloader dependencies | `merlin-dataloader`, `cudf`, `nvtabular` | PyArrow + PyTorch only (zero additional deps) |
+| Training API | Unchanged | Unchanged — same `Trainer`, same schema, same CLI |
+
+---
 
 [![PyPI](https://img.shields.io/pypi/v/Transformers4Rec?color=orange&label=version)](https://pypi.python.org/pypi/Transformers4Rec)
 [![LICENSE](https://img.shields.io/github/license/NVIDIA-Merlin/Transformers4Rec)](https://github.com/NVIDIA-Merlin/Transformers4Rec/blob/stable/LICENSE)
@@ -135,47 +148,70 @@ model = tr.Model(head)
 
 ## Installation
 
-You can install Transformers4Rec with Pip, Conda, or run a Docker container.
+### AMD ROCm GPUs
 
-### Installing Transformers4Rec Using Pip
+No Merlin, cuDF, or NVTabular installation is required. The only runtime dependencies are PyTorch (with ROCm support) and PyArrow.
 
-You can install Transformers4Rec with the functionality to use the GPU-accelerated Merlin dataloader.
-Installation with the dataloader is highly recommended for better performance.
-Those components can be installed as optional arguments for the `pip install` command.
+**Docker (recommended):**
 
-To install Transformers4Rec using Pip, run the following command:
+```shell
+docker run --device=/dev/kfd --device=/dev/dri --group-add video \
+  -v $(pwd)/Transformers4Rec:/workspace/Transformers4Rec \
+  rocm/pytorch-training:v26.1 bash
+
+# Inside the container:
+cd /workspace/Transformers4Rec
+pip install -e .[pytorch]
+```
+
+**Pip (existing ROCm + PyTorch environment):**
+
+```shell
+git clone https://github.com/mvstrauss/Transformers4Rec.git
+cd Transformers4Rec
+git checkout feat/extend-dataloader
+pip install -e .[pytorch]
+```
+
+The `ROCmDataLoader` is selected automatically when ROCm is detected. No CLI flags or code changes are needed — the `Trainer` works identically to the upstream version.
+
+### NVIDIA CUDA GPUs
+
+The original Merlin-based installation paths continue to work unchanged.
+
+**Pip (with Merlin dataloader):**
 
 ```shell
 pip install transformers4rec[nvtabular]
 ```
 
--> Be aware that installing Transformers4Rec with `pip` does not automatically install RAPIDS cuDF.
--> cuDF is required for GPU-accelerated versions of NVTabular transforms and the Merlin Dataloader.
+> Be aware that installing Transformers4Rec with `pip` does not automatically install RAPIDS cuDF.
+> cuDF is required for GPU-accelerated versions of NVTabular transforms and the Merlin Dataloader.
+> Instructions for installing cuDF with pip are available [here](https://docs.rapids.ai/install#pip-install).
 
-Instructions for installing cuDF with pip are available here: https://docs.rapids.ai/install#pip-install
+**Pip (without Merlin — uses the new dataloader):**
 
 ```shell
-pip install cudf-cu11 dask-cudf-cu11 --extra-index-url=https://pypi.nvidia.com
+pip install -e .[pytorch]
+# Then set: --data_loader_engine rocm
 ```
 
-### Installing Transformers4Rec Using Conda
+The new `ROCmDataLoader` also works on NVIDIA hardware and can be used as a lighter-weight alternative to the Merlin dataloader by passing `--data_loader_engine rocm` to the trainer.
 
-To install Transformers4Rec using Conda, run the following command with `conda` or `mamba` to create a new environment.
+**Conda:**
 
 ```shell
 mamba create -n transformers4rec-23.04 -c nvidia -c rapidsai -c pytorch -c conda-forge \
-    transformers4rec=23.04 `# NVIDIA Merlin` \
-    nvtabular=23.04 `# NVIDIA Merlin - Used in example notebooks` \
-    python=3.10 `# Compatible Python environment` \
-    cudf=23.02 `# RAPIDS cuDF - GPU accelerated DataFrame` \
-    cudatoolkit=11.8 pytorch-cuda=11.8 `# NVIDIA CUDA version`
+    transformers4rec=23.04 \
+    nvtabular=23.04 \
+    python=3.10 \
+    cudf=23.02 \
+    cudatoolkit=11.8 pytorch-cuda=11.8
 ```
 
-### Installing Transformers4Rec Using Docker
+**Docker:**
 
-Transformers4Rec is pre-installed in the `merlin-pytorch` container that is available from the NVIDIA GPU Cloud (NGC) catalog.
-
-Refer to the [Merlin Containers](https://nvidia-merlin.github.io/Merlin/stable/containers.html) documentation page for information about the Merlin container names, URLs to container images in the catalog, and key Merlin components.
+Transformers4Rec is pre-installed in the `merlin-pytorch` container available from the [NVIDIA GPU Cloud (NGC) catalog](https://nvidia-merlin.github.io/Merlin/stable/containers.html).
 
 ## Notebook Examples and Tutorials
 
